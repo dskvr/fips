@@ -232,6 +232,7 @@ impl Node {
             }
             self.tree_state.recompute_coords();
             self.coord_cache.clear();
+            self.reset_discovery_backoff();
 
             self.stats_mut().tree.parent_switched += 1;
             self.stats_mut().tree.parent_switches += 1;
@@ -275,6 +276,7 @@ impl Node {
                         return;
                     }
                     self.coord_cache.clear();
+            self.reset_discovery_backoff();
                     self.send_tree_announce_to_all().await;
                 }
                 return;
@@ -299,6 +301,7 @@ impl Node {
             }
             self.tree_state.recompute_coords();
             self.coord_cache.clear();
+            self.reset_discovery_backoff();
 
             let new_root = *self.tree_state.root();
             let new_depth = self.tree_state.my_coords().depth();
@@ -376,6 +379,7 @@ impl Node {
             }
             self.tree_state.recompute_coords();
             self.coord_cache.clear();
+            self.reset_discovery_backoff();
 
             self.stats_mut().tree.parent_switched += 1;
             self.stats_mut().tree.parent_switches += 1;

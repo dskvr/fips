@@ -121,7 +121,7 @@ impl Node {
                     self.check_link_heartbeats().await;
                     self.check_rekey().await;
                     self.check_session_rekey().await;
-                    self.purge_stale_lookups(now_ms);
+                    self.check_pending_lookups(now_ms).await;
                     self.poll_transport_discovery().await;
                     self.sample_transport_congestion();
                 }

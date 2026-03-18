@@ -9,8 +9,12 @@ from jinja2 import Template
 from .scenario import Scenario
 from .topology import SimTopology
 
+# Image name for the pre-built FIPS simulation image.
+# The runner builds this once before starting containers.
+FIPS_SIM_IMAGE = "fips-sim:latest"
+
 # Jinja2 template for the compose file.
-# build context points back to the testing/chaos root where the Dockerfile lives.
+# Uses a pre-built image instead of per-service build to support large topologies.
 _COMPOSE_TEMPLATE = Template(
     """\
 networks:
@@ -21,8 +25,7 @@ networks:
         - subnet: {{ subnet }}
 
 x-fips-common: &fips-common
-  build:
-    context: ../..
+  image: {{ image }}
   cap_add:
     - NET_ADMIN
     - NET_RAW
@@ -67,6 +70,7 @@ def generate_compose(
     content = _COMPOSE_TEMPLATE.render(
         subnet=scenario.topology.subnet,
         rust_log=scenario.logging.rust_log,
+        image=FIPS_SIM_IMAGE,
         nodes=nodes,
     )
 

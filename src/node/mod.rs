@@ -8,6 +8,7 @@ mod bloom;
 mod handlers;
 mod lifecycle;
 mod retry;
+mod discovery_rate_limit;
 mod rate_limit;
 mod routing_error_rate_limit;
 pub(crate) mod session;
@@ -23,6 +24,7 @@ use crate::cache::CoordCache;
 use crate::utils::index::IndexAllocator;
 use crate::node::session::SessionEntry;
 use crate::peer::{ActivePeer, PeerConnection};
+use self::discovery_rate_limit::{DiscoveryBackoff, DiscoveryForwardRateLimiter};
 use self::rate_limit::HandshakeRateLimiter;
 use self::routing_error_rate_limit::RoutingErrorRateLimiter;
 use crate::transport::{
@@ -175,12 +177,17 @@ impl fmt::Display for NodeState {
 /// When a LookupRequest is forwarded through a node, the node stores the
 /// request_id and which peer sent it. When the corresponding LookupResponse
 /// arrives, it's forwarded back to that peer (reverse-path forwarding).
+/// The `response_forwarded` flag prevents response routing loops.
 #[derive(Clone, Debug)]
 pub(crate) struct RecentRequest {
     /// The peer who sent this request to us.
     pub(crate) from_peer: NodeAddr,
     /// When we received this request (Unix milliseconds).
     pub(crate) timestamp_ms: u64,
+    /// Whether we've already forwarded a response for this request.
+    /// Prevents response routing loops when convergent request paths
+    /// create bidirectional entries in recent_requests.
+    pub(crate) response_forwarded: bool,
 }
 
 impl RecentRequest {
@@ -188,6 +195,7 @@ impl RecentRequest {
         Self {
             from_peer,
             timestamp_ms,
+            response_forwarded: false,
         }
     }
 
@@ -323,7 +331,7 @@ pub struct Node {
     // === Pending Discovery Lookups ===
     /// Tracks in-flight discovery lookups. Maps target NodeAddr to the
     /// initiation timestamp (Unix ms). Prevents duplicate flood queries.
-    pending_lookups: HashMap<NodeAddr, u64>,
+    pending_lookups: HashMap<NodeAddr, handlers::discovery::PendingLookup>,
 
     // === Resource Limits ===
     /// Maximum connections (0 = unlimited).
@@ -382,6 +390,10 @@ pub struct Node {
     routing_error_rate_limiter: RoutingErrorRateLimiter,
     /// Rate limiter for source-side CoordsRequired/PathBroken responses.
     coords_response_rate_limiter: RoutingErrorRateLimiter,
+    /// Backoff for failed discovery lookups (originator-side).
+    discovery_backoff: DiscoveryBackoff,
+    /// Rate limiter for forwarded discovery requests (transit-side).
+    discovery_forward_limiter: DiscoveryForwardRateLimiter,
 
     // === Pending Transport Connects ===
     /// Links waiting for transport-level connection establishment before
@@ -472,6 +484,9 @@ impl Node {
         let max_peers = config.node.limits.max_peers;
         let max_links = config.node.limits.max_links;
         let coords_response_interval_ms = config.node.session.coords_response_interval_ms;
+        let backoff_base_secs = config.node.discovery.backoff_base_secs;
+        let backoff_max_secs = config.node.discovery.backoff_max_secs;
+        let forward_min_interval_secs = config.node.discovery.forward_min_interval_secs;
 
         let mut host_map = HostMap::from_peer_configs(config.peers());
         let hosts_file = HostMap::load_hosts_file(std::path::Path::new(
@@ -525,6 +540,13 @@ impl Node {
             routing_error_rate_limiter: RoutingErrorRateLimiter::new(),
             coords_response_rate_limiter: RoutingErrorRateLimiter::with_interval(
                 std::time::Duration::from_millis(coords_response_interval_ms),
+            ),
+            discovery_backoff: DiscoveryBackoff::with_params(
+                backoff_base_secs,
+                backoff_max_secs,
+            ),
+            discovery_forward_limiter: DiscoveryForwardRateLimiter::with_interval(
+                std::time::Duration::from_secs(forward_min_interval_secs),
             ),
             pending_connects: Vec::new(),
             retry_pending: HashMap::new(),
@@ -629,6 +651,8 @@ impl Node {
             coords_response_rate_limiter: RoutingErrorRateLimiter::with_interval(
                 std::time::Duration::from_millis(coords_response_interval_ms),
             ),
+            discovery_backoff: DiscoveryBackoff::new(),
+            discovery_forward_limiter: DiscoveryForwardRateLimiter::new(),
             pending_connects: Vec::new(),
             retry_pending: HashMap::new(),
             last_parent_reeval: None,

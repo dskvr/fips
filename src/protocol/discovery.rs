@@ -1,6 +1,5 @@
 //! Discovery messages: LookupRequest and LookupResponse.
 
-use crate::bloom::BloomFilter;
 use crate::protocol::error::ProtocolError;
 use crate::protocol::session::{decode_coords, encode_coords};
 use crate::tree::TreeCoordinate;
@@ -9,8 +8,9 @@ use secp256k1::schnorr::Signature;
 
 /// Request to discover a node's coordinates.
 ///
-/// Flooded through the network with TTL limiting scope. The visited
-/// filter prevents routing loops.
+/// Routed through the spanning tree via bloom-filter-guided forwarding.
+/// Each transit node forwards only to tree peers whose bloom filter
+/// contains the target. TTL limits propagation depth.
 #[derive(Clone, Debug)]
 pub struct LookupRequest {
     /// Unique request identifier.
@@ -26,8 +26,6 @@ pub struct LookupRequest {
     /// Minimum transport MTU the origin requires for a viable route.
     /// 0 means no requirement.
     pub min_mtu: u16,
-    /// Visited nodes filter (loop prevention).
-    pub visited: BloomFilter,
 }
 
 impl LookupRequest {
@@ -40,8 +38,6 @@ impl LookupRequest {
         ttl: u8,
         min_mtu: u16,
     ) -> Self {
-        // Small filter for visited tracking
-        let visited = BloomFilter::with_params(256 * 8, 5).expect("valid params");
         Self {
             request_id,
             target,
@@ -49,7 +45,6 @@ impl LookupRequest {
             origin_coords,
             ttl,
             min_mtu,
-            visited,
         }
     }
 
@@ -66,15 +61,14 @@ impl LookupRequest {
         Self::new(request_id, target, origin, origin_coords, ttl, min_mtu)
     }
 
-    /// Decrement TTL and add self to visited.
+    /// Decrement TTL for forwarding.
     ///
     /// Returns false if TTL was already 0.
-    pub fn forward(&mut self, my_node_addr: &NodeAddr) -> bool {
+    pub fn forward(&mut self) -> bool {
         if self.ttl == 0 {
             return false;
         }
         self.ttl -= 1;
-        self.visited.insert(my_node_addr);
         true
     }
 
@@ -83,19 +77,12 @@ impl LookupRequest {
         self.ttl > 0
     }
 
-    /// Check if a node was already visited.
-    pub fn was_visited(&self, node_addr: &NodeAddr) -> bool {
-        self.visited.contains(node_addr)
-    }
-
     /// Encode as wire format (includes msg_type byte).
     ///
     /// Format: `[0x30][request_id:8][target:16][origin:16][ttl:1][min_mtu:2]`
     ///         `[origin_coords_cnt:2][origin_coords:16×n]`
-    ///         `[visited_hash_cnt:1][visited_bits:256]`
     pub fn encode(&self) -> Vec<u8> {
-        let visited_bytes = self.visited.as_bytes();
-        let mut buf = Vec::with_capacity(46 + self.origin_coords.depth() * 16 + 1 + visited_bytes.len());
+        let mut buf = Vec::with_capacity(46 + self.origin_coords.depth() * 16);
 
         buf.push(0x30); // msg_type
         buf.extend_from_slice(&self.request_id.to_le_bytes());
@@ -104,8 +91,6 @@ impl LookupRequest {
         buf.push(self.ttl);
         buf.extend_from_slice(&self.min_mtu.to_le_bytes());
         encode_coords(&self.origin_coords, &mut buf);
-        buf.push(self.visited.hash_count());
-        buf.extend_from_slice(visited_bytes);
 
         buf
     }
@@ -113,10 +98,10 @@ impl LookupRequest {
     /// Decode from wire format (after msg_type byte has been consumed).
     pub fn decode(payload: &[u8]) -> Result<Self, ProtocolError> {
         // Minimum: request_id(8) + target(16) + origin(16) + ttl(1) + min_mtu(2)
-        //          + coords_count(2) + hash_count(1) = 46 bytes
-        if payload.len() < 46 {
+        //          + coords_count(2) = 45 bytes
+        if payload.len() < 45 {
             return Err(ProtocolError::MessageTooShort {
-                expected: 46,
+                expected: 45,
                 got: payload.len(),
             });
         }
@@ -150,25 +135,7 @@ impl LookupRequest {
         );
         pos += 2;
 
-        let (origin_coords, consumed) = decode_coords(&payload[pos..])?;
-        pos += consumed;
-
-        if payload.len() < pos + 1 {
-            return Err(ProtocolError::MessageTooShort {
-                expected: pos + 1,
-                got: payload.len(),
-            });
-        }
-        let hash_count = payload[pos];
-        pos += 1;
-
-        let filter_bytes = &payload[pos..];
-        if filter_bytes.is_empty() {
-            return Err(ProtocolError::Malformed("visited filter missing".into()));
-        }
-
-        let visited = BloomFilter::from_slice(filter_bytes, hash_count)
-            .map_err(|e| ProtocolError::Malformed(format!("bad visited filter: {e}")))?;
+        let (origin_coords, _consumed) = decode_coords(&payload[pos..])?;
 
         Ok(Self {
             request_id,
@@ -177,7 +144,6 @@ impl LookupRequest {
             origin_coords,
             ttl,
             min_mtu,
-            visited,
         })
     }
 }
@@ -323,17 +289,12 @@ mod tests {
         let target = make_node_addr(1);
         let origin = make_node_addr(2);
         let coords = make_coords(&[2, 0]);
-        let forwarder = make_node_addr(3);
 
         let mut request = LookupRequest::new(123, target, origin, coords, 5, 0);
 
         assert!(request.can_forward());
-        assert!(!request.was_visited(&forwarder));
-
-        assert!(request.forward(&forwarder));
-
+        assert!(request.forward());
         assert_eq!(request.ttl, 4);
-        assert!(request.was_visited(&forwarder));
     }
 
     #[test]
@@ -344,9 +305,9 @@ mod tests {
 
         let mut request = LookupRequest::new(123, target, origin, coords, 1, 0);
 
-        assert!(request.forward(&make_node_addr(3)));
+        assert!(request.forward());
         assert!(!request.can_forward());
-        assert!(!request.forward(&make_node_addr(4)));
+        assert!(!request.forward());
     }
 
     #[test]
@@ -384,8 +345,8 @@ mod tests {
         let origin = make_node_addr(20);
         let coords = make_coords(&[20, 0]);
 
-        let mut request = LookupRequest::new(12345, target, origin, coords.clone(), 8, 1386);
-        request.forward(&make_node_addr(30));
+        let mut request = LookupRequest::new(12345, target, origin, coords, 8, 1386);
+        request.forward();
 
         let encoded = request.encode();
         assert_eq!(encoded[0], 0x30);
@@ -396,7 +357,6 @@ mod tests {
         assert_eq!(decoded.origin, origin);
         assert_eq!(decoded.ttl, 7); // decremented by forward()
         assert_eq!(decoded.min_mtu, 1386);
-        assert!(decoded.was_visited(&make_node_addr(30)));
     }
 
     #[test]
@@ -438,7 +398,7 @@ mod tests {
         let digest: [u8; 32] = sha2::Sha256::digest(&proof_data).into();
         let sig = secp.sign_schnorr(&digest, &keypair);
 
-        let response = LookupResponse::new(999, target, coords.clone(), sig);
+        let response = LookupResponse::new(999, target, coords, sig);
 
         // Default path_mtu should be u16::MAX
         assert_eq!(response.path_mtu, u16::MAX);

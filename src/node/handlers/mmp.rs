@@ -145,6 +145,7 @@ impl Node {
                 }
                 self.tree_state.recompute_coords();
                 self.coord_cache.clear();
+                self.reset_discovery_backoff();
                 self.stats_mut().tree.parent_switched += 1;
                 self.stats_mut().tree.parent_switches += 1;
                 info!(

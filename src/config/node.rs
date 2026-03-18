@@ -166,6 +166,27 @@ pub struct DiscoveryConfig {
     /// Dedup cache expiry in seconds (`node.discovery.recent_expiry_secs`).
     #[serde(default = "DiscoveryConfig::default_recent_expiry_secs")]
     pub recent_expiry_secs: u64,
+    /// Base backoff after first lookup failure in seconds (`node.discovery.backoff_base_secs`).
+    /// Doubles per consecutive failure up to `backoff_max_secs`.
+    #[serde(default = "DiscoveryConfig::default_backoff_base_secs")]
+    pub backoff_base_secs: u64,
+    /// Maximum backoff cap in seconds (`node.discovery.backoff_max_secs`).
+    #[serde(default = "DiscoveryConfig::default_backoff_max_secs")]
+    pub backoff_max_secs: u64,
+    /// Minimum interval between forwarded lookups for the same target in seconds
+    /// (`node.discovery.forward_min_interval_secs`).
+    /// Defense-in-depth against misbehaving nodes.
+    #[serde(default = "DiscoveryConfig::default_forward_min_interval_secs")]
+    pub forward_min_interval_secs: u64,
+    /// Retry interval within the timeout window in seconds
+    /// (`node.discovery.retry_interval_secs`).
+    /// After this interval without a response, resend the lookup.
+    #[serde(default = "DiscoveryConfig::default_retry_interval_secs")]
+    pub retry_interval_secs: u64,
+    /// Maximum attempts per lookup (`node.discovery.max_attempts`).
+    /// 1 = no retry, 2 = one retry, etc.
+    #[serde(default = "DiscoveryConfig::default_max_attempts")]
+    pub max_attempts: u8,
 }
 
 impl Default for DiscoveryConfig {
@@ -174,6 +195,11 @@ impl Default for DiscoveryConfig {
             ttl: 64,
             timeout_secs: 10,
             recent_expiry_secs: 10,
+            backoff_base_secs: 30,
+            backoff_max_secs: 300,
+            forward_min_interval_secs: 2,
+            retry_interval_secs: 5,
+            max_attempts: 2,
         }
     }
 }
@@ -182,6 +208,11 @@ impl DiscoveryConfig {
     fn default_ttl() -> u8 { 64 }
     fn default_timeout_secs() -> u64 { 10 }
     fn default_recent_expiry_secs() -> u64 { 10 }
+    fn default_backoff_base_secs() -> u64 { 30 }
+    fn default_backoff_max_secs() -> u64 { 300 }
+    fn default_forward_min_interval_secs() -> u64 { 2 }
+    fn default_retry_interval_secs() -> u64 { 5 }
+    fn default_max_attempts() -> u8 { 2 }
 }
 
 /// Spanning tree (`node.tree.*`).

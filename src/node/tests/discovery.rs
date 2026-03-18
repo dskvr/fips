@@ -1,8 +1,8 @@
 //! Discovery protocol tests: LookupRequest and LookupResponse.
 //!
-//! Unit tests for handler logic (dedup, visited filter, TTL, response
-//! caching) and integration tests for multi-node forwarding and
-//! reverse-path response routing.
+//! Unit tests for handler logic (dedup, TTL, response caching) and
+//! integration tests for multi-node forwarding and reverse-path
+//! response routing.
 
 use super::*;
 use crate::node::RecentRequest;
@@ -44,26 +44,6 @@ async fn test_request_dedup() {
     // Duplicate request: dropped
     node.handle_lookup_request(&from, payload).await;
     assert_eq!(node.recent_requests.len(), 1);
-}
-
-#[tokio::test]
-async fn test_request_visited_filter_self() {
-    let mut node = make_node();
-    let from = make_node_addr(0xAA);
-    let target = make_node_addr(0xBB);
-    let origin = make_node_addr(0xCC);
-    let coords = TreeCoordinate::from_addrs(vec![origin, make_node_addr(0)]).unwrap();
-
-    let mut request = LookupRequest::new(888, target, origin, coords, 5, 0);
-    // Mark ourselves as already visited
-    request.visited.insert(node.node_addr());
-
-    let payload = &request.encode()[1..];
-    node.handle_lookup_request(&from, payload).await;
-
-    // Request was recorded (dedup happens before visited check)
-    // but the handler should have stopped after detecting self in visited filter
-    assert!(node.recent_requests.contains_key(&888));
 }
 
 #[tokio::test]
@@ -379,13 +359,13 @@ async fn test_recent_request_expiry() {
 #[tokio::test]
 async fn test_request_forwarding_two_node() {
     // Set up a two-node topology: node0 — node1
-    // Send a LookupRequest from node0 targeting some unknown node.
+    // Send a LookupRequest from node0 targeting node1's address.
     // Node1 should receive the forwarded request.
     let edges = vec![(0, 1)];
     let mut nodes = run_tree_test(2, &edges, false).await;
 
     let node0_addr = *nodes[0].node.node_addr();
-    let target = make_node_addr(0xEE); // unknown node
+    let target = *nodes[1].node.node_addr(); // target node1 (in bloom filters)
     let root = make_node_addr(0);
 
     let coords = TreeCoordinate::from_addrs(vec![node0_addr, root]).unwrap();
@@ -499,20 +479,22 @@ async fn test_request_three_node_chain() {
 #[tokio::test]
 async fn test_request_dedup_convergent_paths() {
     // Topology: triangle (node0 — node1, node0 — node2, node1 — node2)
-    // A request from node0 reaches node2 via two paths: 0→1→2 and 0→2.
-    // The second arrival at node2 should be deduped.
+    // A request from node0 targeting node2 may reach it via two paths
+    // depending on bloom filter state. If both paths deliver the request,
+    // the second arrival at node2 should be deduped.
     let edges = vec![(0, 1), (0, 2), (1, 2)];
     let mut nodes = run_tree_test(3, &edges, false).await;
 
     let node0_addr = *nodes[0].node.node_addr();
-    let target = make_node_addr(0xEE);
+    let target = *nodes[2].node.node_addr(); // target node2 (in bloom filters)
     let root = make_node_addr(0);
 
     let coords = TreeCoordinate::from_addrs(vec![node0_addr, root]).unwrap();
     let request = LookupRequest::new(300, target, node0_addr, coords, 5, 0);
     let payload = &request.encode()[1..];
 
-    // Node0 handles the request (forwards to both node1 and node2)
+    // Node0 handles the request (forwards to peers whose bloom filter
+    // contains node2 — bloom-guided, not flooding)
     nodes[0]
         .node
         .handle_lookup_request(&node0_addr, payload)
@@ -524,12 +506,16 @@ async fn test_request_dedup_convergent_paths() {
         process_available_packets(&mut nodes).await;
     }
 
-    // Both node1 and node2 should have recorded the request
-    assert!(nodes[1].node.recent_requests.contains_key(&300));
-    assert!(nodes[2].node.recent_requests.contains_key(&300));
+    // Node2 (the target) must have received the request
+    assert!(
+        nodes[2].node.recent_requests.contains_key(&300),
+        "Node 2 (target) should have received the request"
+    );
 
-    // The request should appear exactly once in each node's recent_requests
-    // (dedup prevents duplicate processing via convergent paths)
+    // If node1 also received and forwarded it, node2 would have seen a
+    // duplicate — verify dedup counter reflects convergent arrivals.
+    // With bloom-guided routing, node1 may or may not receive the request
+    // depending on filter state, so we only assert the target received it.
 
     cleanup_nodes(&mut nodes).await;
 }

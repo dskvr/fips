@@ -8,6 +8,7 @@
 #   -v, --verbose          Enable debug logging
 #   --seed <N>             Override scenario seed
 #   --duration <secs>      Override scenario duration
+#   --nodes <N>            Override topology.num_nodes
 #   --list                 List available scenarios
 #
 # Examples:
@@ -33,6 +34,7 @@ usage() {
     echo "  -v, --verbose       Enable debug logging"
     echo "  --seed <N>          Override scenario seed"
     echo "  --duration <secs>   Override scenario duration"
+    echo "  --nodes <N>         Override topology.num_nodes"
     echo "  --list              List available scenarios"
     exit 1
 }
@@ -62,12 +64,14 @@ SCENARIO_ARG=""
 VERBOSE=""
 SEED=""
 DURATION=""
+NODES=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
         -v|--verbose) VERBOSE="--verbose"; shift ;;
         --seed)       SEED="$2"; shift 2 ;;
         --duration)   DURATION="$2"; shift 2 ;;
+        --nodes)      NODES="$2"; shift 2 ;;
         --list)       list_scenarios ;;
         -*)           echo "Error: Unknown option '$1'" >&2; usage ;;
         *)
@@ -137,7 +141,16 @@ echo "  Scenario: $(basename "$SCENARIO_FILE" .yaml)"
 echo "  File:     $SCENARIO_FILE"
 [ -n "$SEED" ] && echo "  Seed:     $SEED (override)"
 [ -n "$DURATION" ] && echo "  Duration: ${DURATION}s (override)"
+[ -n "$NODES" ] && echo "  Nodes:    $NODES (override)"
 echo ""
+
+# If --nodes is specified, create a patched copy of the scenario file
+if [ -n "$NODES" ]; then
+    PATCHED=$(mktemp /tmp/chaos-scenario-XXXXXX.yaml)
+    sed "s/^\(  num_nodes:\).*/\1 $NODES/" "$SCENARIO_FILE" > "$PATCHED"
+    PYTHON_ARGS[0]="$PATCHED"
+    trap 'rm -f "$PATCHED"' EXIT
+fi
 
 # Run from testing/chaos directory (sim expects relative paths)
 cd "$CHAOS_DIR"

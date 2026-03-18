@@ -432,6 +432,7 @@ impl Node {
                         }
                         // Schedule filter announce (sent on next tick via debounce)
                         self.bloom_state.mark_update_needed(node_addr);
+                        self.reset_discovery_backoff();
                     }
                     PromotionResult::CrossConnectionWon { loser_link_id, node_addr } => {
                         // Store msg2 on peer for resend on duplicate msg1
@@ -459,6 +460,7 @@ impl Node {
                         }
                         // Schedule filter announce (sent on next tick via debounce)
                         self.bloom_state.mark_update_needed(node_addr);
+                        self.reset_discovery_backoff();
                     }
                     PromotionResult::CrossConnectionLost { winner_link_id } => {
                         // Close the losing TCP connection (no-op for connectionless)
@@ -765,6 +767,7 @@ impl Node {
             }
             // Schedule filter announce (sent on next tick via debounce)
             self.bloom_state.mark_update_needed(peer_node_addr);
+            self.reset_discovery_backoff();
             return;
         }
 
@@ -786,6 +789,7 @@ impl Node {
                         }
                         // Schedule filter announce (sent on next tick via debounce)
                         self.bloom_state.mark_update_needed(node_addr);
+                        self.reset_discovery_backoff();
                     }
                     PromotionResult::CrossConnectionWon { loser_link_id, node_addr } => {
                         // Close the losing TCP connection (no-op for connectionless)
@@ -814,6 +818,7 @@ impl Node {
                         }
                         // Schedule filter announce (sent on next tick via debounce)
                         self.bloom_state.mark_update_needed(node_addr);
+                        self.reset_discovery_backoff();
                     }
                     PromotionResult::CrossConnectionLost { winner_link_id } => {
                         // Close the losing TCP connection (no-op for connectionless)

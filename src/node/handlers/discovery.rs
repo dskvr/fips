@@ -1,25 +1,25 @@
 //! LookupRequest/LookupResponse discovery protocol handlers.
 //!
-//! Handles coordinate discovery requests: flood-based lookup with TTL,
-//! visited filter for loop prevention, and reverse-path forwarding for
-//! responses.
+//! Handles coordinate discovery via bloom-filter-guided tree routing.
+//! Requests are forwarded only to tree peers (parent + children) whose
+//! bloom filter contains the target. TTL and request_id dedup provide
+//! safety bounds.
 
 use crate::node::{Node, RecentRequest};
 use crate::protocol::{LookupRequest, LookupResponse};
 use crate::{NodeAddr, PeerIdentity};
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 impl Node {
     /// Handle an incoming LookupRequest from a peer.
     ///
     /// Processing steps:
     /// 1. Decode and validate
-    /// 2. Check request_id for duplicates (dedup)
+    /// 2. Check request_id for duplicates (dedup / reverse-path routing)
     /// 3. Record request for reverse-path forwarding
     /// 4. Lazy purge expired entries
-    /// 5. Check visited filter (loop prevention)
-    /// 6. If we're the target, generate and send response
-    /// 7. If TTL > 0, forward to peers not in visited filter
+    /// 5. If we're the target, generate and send response
+    /// 6. If TTL > 0, forward to tree peers whose bloom filter matches
     pub(in crate::node) async fn handle_lookup_request(
         &mut self,
         from: &NodeAddr,
@@ -38,10 +38,12 @@ impl Node {
 
         let now_ms = Self::now_ms();
 
-        // Dedup: drop if we've already seen this request_id
+        // Dedup: drop if we've already seen this request_id.
+        // Also serves as loop protection — tree routing is loop-free,
+        // but request_id dedup catches edge cases during tree restructuring.
         if self.recent_requests.contains_key(&request.request_id) {
             self.stats_mut().discovery.req_duplicate += 1;
-            trace!(
+            debug!(
                 request_id = request.request_id,
                 from = %self.peer_display_name(from),
                 "Duplicate LookupRequest, dropping"
@@ -58,17 +60,6 @@ impl Node {
         // Lazy purge expired entries
         self.purge_expired_requests(now_ms);
 
-        // Loop prevention: drop if we've already been visited
-        if request.was_visited(self.node_addr()) {
-            self.stats_mut().discovery.req_already_visited += 1;
-            trace!(
-                request_id = request.request_id,
-                target = %self.peer_display_name(&request.target),
-                "Already visited, dropping LookupRequest"
-            );
-            return;
-        }
-
         // Are we the target?
         if request.target == *self.node_addr() {
             self.stats_mut().discovery.req_target_is_us += 1;
@@ -83,14 +74,25 @@ impl Node {
 
         // Forward if TTL permits
         if request.can_forward() {
+            // Transit-side rate limit: collapse rapid-fire lookups for the
+            // same target from misbehaving nodes generating fresh request_ids.
+            if !self.discovery_forward_limiter.should_forward(&request.target) {
+                self.stats_mut().discovery.req_forward_rate_limited += 1;
+                debug!(
+                    request_id = request.request_id,
+                    target = %self.peer_display_name(&request.target),
+                    "Forward rate limited, suppressing LookupRequest"
+                );
+                return;
+            }
             self.stats_mut().discovery.req_forwarded += 1;
             self.forward_lookup_request(request).await;
         } else {
             self.stats_mut().discovery.req_ttl_exhausted += 1;
-            trace!(
+            debug!(
                 request_id = request.request_id,
                 target = %self.peer_display_name(&request.target),
-                "LookupRequest TTL exhausted, not forwarding"
+                "LookupRequest TTL exhausted"
             );
         }
     }
@@ -121,7 +123,19 @@ impl Node {
         let now_ms = Self::now_ms();
 
         // Check if we forwarded this request (transit node) or originated it
-        if let Some(recent) = self.recent_requests.get(&response.request_id) {
+        if let Some(recent) = self.recent_requests.get_mut(&response.request_id) {
+            // Already forwarded a response for this request — drop to
+            // prevent response routing loops.
+            if recent.response_forwarded {
+                debug!(
+                    request_id = response.request_id,
+                    target = %self.peer_display_name(&response.target),
+                    "Response already forwarded for this request, dropping"
+                );
+                return;
+            }
+            recent.response_forwarded = true;
+
             // Transit node: reverse-path forward
             let from_peer = recent.from_peer;
             self.stats_mut().discovery.resp_forwarded += 1;
@@ -195,12 +209,15 @@ impl Node {
 
             self.stats_mut().discovery.resp_accepted += 1;
 
-            debug!(
+            // Clear backoff on success — target is reachable
+            self.discovery_backoff.record_success(&target);
+
+            info!(
                 request_id = response.request_id,
                 target = %self.peer_display_name(&target),
                 depth = response.target_coords.depth(),
                 path_mtu = path_mtu,
-                "Received LookupResponse, proof verified, caching route"
+                "Discovery succeeded, proof verified, route cached"
             );
 
             self.coord_cache.insert_with_path_mtu(
@@ -214,9 +231,6 @@ impl Node {
             self.pending_lookups.remove(&target);
 
             // If an established session exists, reset the warmup counter.
-            // Discovery has completed and transit nodes along the response
-            // path now have fresh coords. Reset warmup so the next N
-            // data packets include COORDS_PRESENT to re-warm the forward path.
             if let Some(entry) = self.sessions.get_mut(&target)
                 && entry.is_established()
             {
@@ -232,22 +246,18 @@ impl Node {
             // If we have pending TUN packets for this target, retry session
             // initiation. The coord_cache now has coords, so find_next_hop()
             // should succeed.
-            if self.pending_tun_packets.contains_key(&target) {
+            if let Some(packets) = self.pending_tun_packets.get(&target) {
+                debug!(
+                    dest = %self.peer_display_name(&target),
+                    queued_packets = packets.len(),
+                    "Retrying queued packets after discovery"
+                );
                 self.retry_session_after_discovery(target).await;
             }
         }
     }
 
     /// Generate and send a LookupResponse when we are the target.
-    ///
-    /// Signs a proof using our identity and routes the response back
-    /// toward the origin via reverse-path forwarding. The first hop
-    /// uses the `recent_requests` entry (which records who sent us the
-    /// request), ensuring the response follows the same path the
-    /// request took. This is critical because greedy tree routing
-    /// might send the response to a peer that never forwarded the
-    /// request and thus has no `recent_requests` entry, causing the
-    /// response to be discarded.
     async fn send_lookup_response(&mut self, request: &LookupRequest) {
         let our_coords = self.tree_state().my_coords().clone();
 
@@ -262,10 +272,7 @@ impl Node {
             proof,
         );
 
-        // Route toward origin via reverse path. The recent_requests entry
-        // was recorded before we got here (line 49-51), so from_peer is
-        // the node that forwarded the request to us — the correct first
-        // hop for the response's reverse path.
+        // Route toward origin via reverse path.
         let next_hop_addr = if let Some(recent) = self.recent_requests.get(&request.request_id) {
             recent.from_peer
         } else {
@@ -299,26 +306,30 @@ impl Node {
         }
     }
 
-    /// Forward a LookupRequest to peers not in the visited filter.
+    /// Forward a LookupRequest to eligible tree peers.
     ///
-    /// Decrements TTL, adds self to visited, and sends to all eligible peers.
+    /// Decrements TTL and sends to tree peers (parent + children) whose
+    /// bloom filter contains the target. Restricting to tree peers follows
+    /// the spanning tree partition, producing a single directed path.
     async fn forward_lookup_request(&mut self, mut request: LookupRequest) {
-        if !request.forward(self.node_addr()) {
+        if !request.forward() {
             return;
         }
 
-        // Collect peers not in visited filter
+        // Collect tree peers whose bloom filter contains the target
         let forward_to: Vec<NodeAddr> = self
             .peers
-            .keys()
-            .filter(|addr| !request.was_visited(addr))
-            .copied()
+            .iter()
+            .filter(|(addr, peer)| {
+                self.is_tree_peer(addr) && peer.may_reach(&request.target)
+            })
+            .map(|(addr, _)| *addr)
             .collect();
 
         if forward_to.is_empty() {
             trace!(
                 request_id = request.request_id,
-                "No eligible peers to forward LookupRequest"
+                "No eligible tree peers to forward LookupRequest"
             );
             return;
         }
@@ -346,30 +357,42 @@ impl Node {
 
     /// Initiate a discovery lookup for a target node.
     ///
-    /// Creates a LookupRequest and floods it to all peers. The originator
-    /// does NOT record the request_id in recent_requests, so when the
-    /// response arrives, it's recognized as "our request" and the
-    /// target's coordinates are cached in coord_cache.
-    pub(in crate::node) async fn initiate_lookup(&mut self, target: &NodeAddr, ttl: u8) {
+    /// Creates a LookupRequest and sends it to tree peers whose bloom
+    /// filters contain the target. Returns the number of peers sent to.
+    /// The originator does NOT record the request_id in recent_requests,
+    /// so when the response arrives, it's recognized as "our request".
+    pub(in crate::node) async fn initiate_lookup(&mut self, target: &NodeAddr, ttl: u8) -> usize {
         self.stats_mut().discovery.req_initiated += 1;
 
         let origin = *self.node_addr();
         let origin_coords = self.tree_state().my_coords().clone();
-        let mut request = LookupRequest::generate(*target, origin, origin_coords, ttl, 0);
+        let request = LookupRequest::generate(*target, origin, origin_coords, ttl, 0);
 
-        // Add ourselves to the visited filter so forwarding nodes
-        // won't send the request back to us
-        request.visited.insert(&origin);
+        // Send only to tree peers whose bloom filter contains the target
+        let peer_addrs: Vec<NodeAddr> = self
+            .peers
+            .iter()
+            .filter(|(addr, peer)| {
+                self.is_tree_peer(addr) && peer.may_reach(target)
+            })
+            .map(|(addr, _)| *addr)
+            .collect();
 
-        debug!(
+        let peer_count = peer_addrs.len();
+
+        info!(
             request_id = request.request_id,
             target = %self.peer_display_name(target),
             ttl = ttl,
-            "Initiating LookupRequest"
+            peer_count = peer_count,
+            total_peers = self.peers.len(),
+            "Discovery lookup initiated"
         );
 
-        // Send to all peers (flood)
-        let peer_addrs: Vec<NodeAddr> = self.peers.keys().copied().collect();
+        if peer_count == 0 {
+            return 0;
+        }
+
         let encoded = request.encode();
 
         for peer_addr in peer_addrs {
@@ -381,47 +404,151 @@ impl Node {
                 );
             }
         }
+
+        peer_count
     }
 
     /// Initiate a discovery lookup if one is not already pending for this target.
     ///
-    /// Deduplicates lookups using `pending_lookups` with a timeout. If a
-    /// lookup was recently initiated and hasn't timed out, this is a no-op.
+    /// Checks: pending dedup, backoff, bloom filter pre-check. If all pass,
+    /// initiates the lookup. If no tree peers have the target in their bloom
+    /// filter, the lookup is skipped (bloom miss) and recorded as a failure
+    /// for backoff purposes.
     pub(in crate::node) async fn maybe_initiate_lookup(&mut self, dest: &NodeAddr) {
         let now_ms = Self::now_ms();
         let lookup_timeout_ms = self.config.node.discovery.timeout_secs * 1000;
-        if let Some(&initiated_at) = self.pending_lookups.get(dest)
-            && now_ms.saturating_sub(initiated_at) < lookup_timeout_ms
-        {
-            self.stats_mut().discovery.req_deduplicated += 1;
+
+        // Check pending lookup dedup (in-flight)
+        if let Some(entry) = self.pending_lookups.get(dest) {
+            let age_ms = now_ms.saturating_sub(entry.initiated_ms);
+            let attempt = entry.attempt;
+            if age_ms < lookup_timeout_ms {
+                self.stats_mut().discovery.req_deduplicated += 1;
+                debug!(
+                    target_node = %self.peer_display_name(dest),
+                    age_ms = age_ms,
+                    attempt = attempt,
+                    "Discovery lookup deduplicated, already pending"
+                );
+                return;
+            }
+        }
+
+        // Check backoff from previous failures
+        if self.discovery_backoff.is_suppressed(dest) {
+            self.stats_mut().discovery.req_backoff_suppressed += 1;
+            debug!(
+                target_node = %self.peer_display_name(dest),
+                failures = self.discovery_backoff.failure_count(dest),
+                "Discovery lookup suppressed by backoff"
+            );
             return;
         }
-        self.pending_lookups.insert(*dest, now_ms);
+
+        // Bloom filter pre-check: if no peer's filter contains the target,
+        // it's not in the mesh — skip the lookup and record as failure.
+        let reachable = self.peers.values().any(|peer| peer.may_reach(dest));
+        if !reachable {
+            self.stats_mut().discovery.req_bloom_miss += 1;
+            self.discovery_backoff.record_failure(dest);
+            debug!(
+                target_node = %self.peer_display_name(dest),
+                "Discovery skipped, target not in any peer bloom filter"
+            );
+            return;
+        }
+
+        self.pending_lookups.insert(*dest, PendingLookup::new(now_ms));
         let ttl = self.config.node.discovery.ttl;
-        self.initiate_lookup(dest, ttl).await;
+        let sent = self.initiate_lookup(dest, ttl).await;
+
+        // If no tree peers had the target, fail immediately
+        if sent == 0 {
+            self.pending_lookups.remove(dest);
+            self.discovery_backoff.record_failure(dest);
+            debug!(
+                target_node = %self.peer_display_name(dest),
+                "Discovery failed, no tree peers with bloom match"
+            );
+        }
     }
 
-    /// Remove timed-out pending lookups and drain their queued packets.
+    /// Check pending lookups for retry or timeout.
     ///
-    /// Called periodically from the tick handler. For each timed-out lookup,
-    /// sends ICMPv6 Destination Unreachable for any queued TUN packets and
-    /// removes them from the pending queue.
-    pub(in crate::node) fn purge_stale_lookups(&mut self, now_ms: u64) {
-        let timed_out: Vec<NodeAddr> = self
-            .pending_lookups
-            .iter()
-            .filter(|&(_, &ts)| now_ms.saturating_sub(ts) >= self.config.node.discovery.timeout_secs * 1000)
-            .map(|(addr, _)| *addr)
-            .collect();
+    /// Called periodically from the tick handler. For each pending lookup:
+    /// - If retry interval elapsed and attempts remain: resend
+    /// - If total timeout elapsed: fail, record backoff, send ICMP unreachable
+    pub(in crate::node) async fn check_pending_lookups(&mut self, now_ms: u64) {
+        let timeout_ms = self.config.node.discovery.timeout_secs * 1000;
+        let retry_ms = self.config.node.discovery.retry_interval_secs * 1000;
 
-        for addr in timed_out {
+        // Collect targets needing action
+        let mut to_retry: Vec<NodeAddr> = Vec::new();
+        let mut to_timeout: Vec<NodeAddr> = Vec::new();
+
+        for (&target, entry) in &self.pending_lookups {
+            let age = now_ms.saturating_sub(entry.initiated_ms);
+            if age >= timeout_ms {
+                to_timeout.push(target);
+            } else if entry.attempt < self.config.node.discovery.max_attempts
+                && now_ms.saturating_sub(entry.last_sent_ms) >= retry_ms
+            {
+                to_retry.push(target);
+            }
+        }
+
+        // Process retries
+        for target in to_retry {
+            if let Some(entry) = self.pending_lookups.get_mut(&target) {
+                entry.attempt += 1;
+                entry.last_sent_ms = now_ms;
+                let attempt = entry.attempt;
+
+                let ttl = self.config.node.discovery.ttl;
+                let sent = self.initiate_lookup(&target, ttl).await;
+                if sent > 0 {
+                    debug!(
+                        target_node = %self.peer_display_name(&target),
+                        attempt = attempt,
+                        "Discovery retry sent"
+                    );
+                }
+            }
+        }
+
+        // Process timeouts
+        for addr in to_timeout {
             self.stats_mut().discovery.resp_timed_out += 1;
             self.pending_lookups.remove(&addr);
-            if let Some(packets) = self.pending_tun_packets.remove(&addr) {
+
+            // Record failure for backoff
+            self.discovery_backoff.record_failure(&addr);
+            let failures = self.discovery_backoff.failure_count(&addr);
+
+            let queued = self.pending_tun_packets.remove(&addr);
+            let pkt_count = queued.as_ref().map_or(0, |p| p.len());
+            info!(
+                target_node = %self.peer_display_name(&addr),
+                queued_packets = pkt_count,
+                failures = failures,
+                "Discovery lookup timed out, destination unreachable"
+            );
+            if let Some(packets) = queued {
                 for pkt in &packets {
                     self.send_icmpv6_dest_unreachable(pkt);
                 }
             }
+        }
+    }
+
+    /// Reset discovery backoff on topology changes.
+    pub(in crate::node) fn reset_discovery_backoff(&mut self) {
+        if !self.discovery_backoff.is_empty() {
+            debug!(
+                entries = self.discovery_backoff.entry_count(),
+                "Resetting discovery backoff on topology change"
+            );
+            self.discovery_backoff.reset_all();
         }
     }
 
@@ -431,5 +558,24 @@ impl Node {
         self.recent_requests
             .retain(|_, entry| !entry.is_expired(current_time_ms, expiry_ms));
     }
+}
 
+/// Tracks a pending discovery lookup with retry state.
+pub(crate) struct PendingLookup {
+    /// When the lookup was first initiated.
+    pub initiated_ms: u64,
+    /// When the last attempt was sent.
+    pub last_sent_ms: u64,
+    /// Current attempt number (1 = initial, 2 = first retry, ...).
+    pub attempt: u8,
+}
+
+impl PendingLookup {
+    pub fn new(now_ms: u64) -> Self {
+        Self {
+            initiated_ms: now_ms,
+            last_sent_ms: now_ms,
+            attempt: 1,
+        }
+    }
 }
