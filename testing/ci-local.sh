@@ -297,7 +297,7 @@ run_integration() {
         return
     fi
 
-    # Static topologies (sequential — they share the docker-compose)
+    # Static topologies (sequential — profiles share container names)
     for topo in "${STATIC_SUITES[@]}"; do
         local topology="${topo#static-}"
         run_static "$topology"
