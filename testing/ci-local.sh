@@ -15,9 +15,10 @@
 #
 # Integration suites:
 #   static-mesh, static-chain, rekey,
-#   chaos-smoke-10, chaos-10, ethernet-mesh, ethernet-only,
-#   bottleneck-parent, cost-avoidance, cost-mixed-7node,
-#   cost-reeval, cost-stability, depth-vs-cost, mixed-technology,
+#   chaos-smoke-10, chaos-churn-mixed-10, chaos-ethernet-mesh,
+#   chaos-ethernet-only, chaos-bottleneck-parent, chaos-cost-avoidance,
+#   chaos-cost-mixed-7node, chaos-cost-reeval, chaos-cost-stability,
+#   chaos-depth-vs-cost, chaos-mixed-technology,
 #   sidecar
 #
 # Exit codes:
@@ -47,11 +48,19 @@ ONLY_SUITE=""
 # All integration suites matching ci.yml
 STATIC_SUITES=(static-mesh static-chain)
 REKEY_SUITES=(rekey)
+# Each entry: "display-name scenario [--flag value ...]"
 CHAOS_SUITES=(
-    chaos-smoke-10 chaos-10
-    ethernet-mesh ethernet-only
-    bottleneck-parent cost-avoidance cost-mixed-7node
-    cost-reeval cost-stability depth-vs-cost mixed-technology
+    "smoke-10 smoke-10"
+    "churn-mixed-10 churn-mixed --nodes 10 --duration 120"
+    "ethernet-mesh ethernet-mesh"
+    "ethernet-only ethernet-only"
+    "bottleneck-parent bottleneck-parent"
+    "cost-avoidance cost-avoidance"
+    "cost-mixed-7node cost-mixed-7node"
+    "cost-reeval cost-reeval"
+    "cost-stability cost-stability"
+    "depth-vs-cost depth-vs-cost"
+    "mixed-technology mixed-technology"
 )
 SIDECAR_SUITES=(sidecar)
 
@@ -83,7 +92,10 @@ list_suites() {
     for s in "${REKEY_SUITES[@]}"; do echo "    $s"; done
     echo ""
     echo "  Chaos scenarios:"
-    for s in "${CHAOS_SUITES[@]}"; do echo "    $s"; done
+    for entry in "${CHAOS_SUITES[@]}"; do
+        read -ra parts <<< "$entry"
+        echo "    chaos-${parts[0]}  (${parts[*]:1})"
+    done
     echo ""
     echo "  Sidecar:"
     for s in "${SIDECAR_SUITES[@]}"; do echo "    $s"; done
@@ -238,17 +250,18 @@ run_rekey() {
 
 # Run a chaos scenario
 run_chaos() {
-    local scenario="$1"
+    local name="$1"
+    shift
     local rc=0
 
-    info "[chaos/$scenario] Running simulation"
-    if bash testing/chaos/scripts/chaos.sh "$scenario" 2>&1; then
+    info "[chaos/$name] Running simulation"
+    if bash testing/chaos/scripts/chaos.sh "$@" 2>&1; then
         rc=0
     else
         rc=1
     fi
 
-    record "chaos-$scenario" $rc
+    record "chaos-$name" $rc
 }
 
 # Run sidecar test
@@ -300,8 +313,11 @@ run_integration() {
         local suite_names=()
         local running=0
 
-        for suite in "${CHAOS_SUITES[@]}"; do
-            local scenario="${suite#chaos-}"
+        for entry in "${CHAOS_SUITES[@]}"; do
+            # Parse: "display-name scenario [flags...]"
+            read -ra parts <<< "$entry"
+            local name="${parts[0]}"
+            local args=("${parts[@]:1}")
 
             # Throttle: wait for a slot
             while [[ $running -ge $PARALLEL_JOBS ]]; do
@@ -311,12 +327,12 @@ run_integration() {
 
             # Run in background, capture output to temp file
             local logfile
-            logfile=$(mktemp "/tmp/ci-chaos-${scenario}.XXXXXX")
+            logfile=$(mktemp "/tmp/ci-chaos-${name}.XXXXXX")
             (
-                run_chaos "$scenario" >"$logfile" 2>&1
+                run_chaos "$name" "${args[@]}" >"$logfile" 2>&1
             ) &
             pids+=($!)
-            suite_names+=("$scenario:$logfile")
+            suite_names+=("$name:$logfile")
             running=$((running + 1))
         done
 
@@ -353,7 +369,21 @@ run_suite() {
         rekey)
             run_rekey ;;
         chaos-*)
-            run_chaos "${suite#chaos-}" ;;
+            local chaos_name="${suite#chaos-}"
+            local found=false
+            for entry in "${CHAOS_SUITES[@]}"; do
+                read -ra parts <<< "$entry"
+                if [[ "${parts[0]}" == "$chaos_name" ]]; then
+                    run_chaos "$chaos_name" "${parts[@]:1}"
+                    found=true
+                    break
+                fi
+            done
+            if [[ "$found" != true ]]; then
+                # Fall back to using the name as the scenario directly
+                run_chaos "$chaos_name" "$chaos_name"
+            fi
+            ;;
         sidecar)
             run_sidecar ;;
         *)
