@@ -19,7 +19,7 @@ trap 'echo ""; echo "Test interrupted — cleaning up..."; docker compose down 2
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TEST_DIR="$SCRIPT_DIR/.."
-DERIVE_KEYS="$SCRIPT_DIR/../../../static/scripts/derive-keys.py"
+DERIVE_KEYS="$SCRIPT_DIR/../../../lib/derive_keys.py"
 cd "$TEST_DIR"
 
 PASSED=0
