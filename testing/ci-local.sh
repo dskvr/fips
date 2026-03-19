@@ -195,9 +195,6 @@ run_static() {
     info "[$topology] Generating configs"
     bash testing/static/scripts/generate-configs.sh "$topology" || { record "static-$topology" 1; return; }
 
-    info "[$topology] Building Docker images"
-    docker compose -f "$compose" --profile "$topology" build --quiet || { record "static-$topology" 1; return; }
-
     info "[$topology] Starting containers"
     docker compose -f "$compose" --profile "$topology" up -d || { record "static-$topology" 1; return; }
 
@@ -222,9 +219,6 @@ run_rekey() {
     info "[rekey] Generating configs"
     bash testing/static/scripts/generate-configs.sh rekey || { record "rekey" 1; return; }
     bash testing/static/scripts/rekey-test.sh inject-config || { record "rekey" 1; return; }
-
-    info "[rekey] Building Docker images"
-    docker compose -f "$compose" --profile rekey build --quiet || { record "rekey" 1; return; }
 
     info "[rekey] Starting containers"
     docker compose -f "$compose" --profile rekey up -d || { record "rekey" 1; return; }
@@ -275,24 +269,14 @@ run_sidecar() {
 run_integration() {
     stage "Stage 3: Integration Tests"
 
-    # Install binaries to test directories
-    info "Installing release binaries to test directories"
-    install_binaries testing/static
-    install_binaries testing/chaos
-    install_binaries testing/sidecar
+    # Install binaries to shared docker context
+    info "Installing release binaries"
+    install_binaries testing/docker
 
-    # Build chaos Docker image once (shared by all chaos scenarios)
-    local need_chaos=false
-    if [[ -z "$ONLY_SUITE" && "$SKIP_CHAOS" != true ]]; then
-        need_chaos=true
-    elif [[ "$ONLY_SUITE" == chaos-* ]]; then
-        need_chaos=true
-    fi
-
-    if [[ "$need_chaos" == true ]]; then
-        info "Building chaos Docker image"
-        docker build -t fips-chaos:latest testing/chaos --quiet || { record "chaos-build" 1; return; }
-    fi
+    # Build unified test image once (used by all harnesses)
+    info "Building fips-test Docker image"
+    docker build -t fips-test:latest testing/docker --quiet || { record "docker-build" 1; return; }
+    docker build -t fips-test-app:latest -f testing/docker/Dockerfile.app testing/docker --quiet || { record "docker-build-app" 1; return; }
 
     # Single suite mode
     if [[ -n "$ONLY_SUITE" ]]; then

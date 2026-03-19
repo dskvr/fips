@@ -9,9 +9,9 @@ from jinja2 import Template
 from .scenario import Scenario
 from .topology import SimTopology
 
-# Image name for the pre-built FIPS simulation image.
+# Image name for the pre-built FIPS test image.
 # The runner builds this once before starting containers.
-FIPS_SIM_IMAGE = "fips-sim:latest"
+FIPS_SIM_IMAGE = "fips-test:latest"
 
 # Jinja2 template for the compose file.
 # Uses a pre-built image instead of per-service build to support large topologies.
@@ -39,6 +39,7 @@ x-fips-common: &fips-common
   environment:
     - RUST_LOG={{ rust_log }}
     - RUST_BACKTRACE=1
+    - FIPS_TEST_MODE=chaos
 
 services:
 {% for node in nodes %}
@@ -47,7 +48,6 @@ services:
     container_name: fips-node-{{ node.node_id }}
     hostname: {{ node.node_id }}
     volumes:
-      - ../../resolv.conf:/etc/resolv.conf:ro
       - ./{{ node.node_id }}.yaml:/etc/fips/fips.yaml:ro
     networks:
       fips-net:

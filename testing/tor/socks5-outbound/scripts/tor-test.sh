@@ -80,7 +80,7 @@ echo ""
 # ── Phase 1: Build and start ─────────────────────────────────────
 echo "Phase 1: Starting Tor daemon and FIPS nodes..."
 docker compose down 2>/dev/null || true
-docker compose up -d --build
+docker compose up -d
 echo ""
 
 # ── Phase 2: Wait for Tor bootstrap ─────────────────────────────

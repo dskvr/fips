@@ -120,11 +120,12 @@ class SimRunner:
         self.compose_file = generate_compose(self.topology, self.scenario, config_dir)
         log.info("Wrote %s", self.compose_file)
 
-        # 4. Build the simulation image once (avoids per-service build at scale)
+        # 4. Build the test image once (avoids per-service build at scale)
         log.info("Building Docker image...")
         from .compose import FIPS_SIM_IMAGE
+        docker_dir = os.path.join(os.path.dirname(__file__), "..", "..", "docker")
         subprocess.run(
-            ["docker", "build", "-t", FIPS_SIM_IMAGE, "."],
+            ["docker", "build", "-t", FIPS_SIM_IMAGE, docker_dir],
             check=True,
         )
 

@@ -84,7 +84,7 @@ echo ""
 # ── Phase 1: Start node A (Tor + FIPS co-located) ────────────────
 echo "Phase 1: Starting node A (Tor+FIPS, directory-mode onion service)..."
 docker compose down 2>/dev/null || true
-docker compose up -d --build fips-a
+docker compose up -d fips-a
 echo ""
 
 # ── Phase 2: Wait for onion service creation ─────────────────────
